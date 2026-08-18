@@ -7,6 +7,15 @@ systems.
 
 ---
 
+## 🚀 Live Demo
+
+👉 https://ai-agent-tool-use-cxyqyzpactangjdzs6igqc.streamlit.app/
+
+Try the agent directly in your browser — ask it to calculate something,
+check the weather, or tell you the date.
+
+---
+
 ## 📌 Project Overview
 
 Unlike a plain chatbot, this agent has access to a set of real
