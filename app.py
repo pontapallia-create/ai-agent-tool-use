@@ -11,6 +11,7 @@ Author: Ponthapalli Arun Kumar
 
 import ast
 import operator
+import time
 from datetime import datetime
 
 import requests
@@ -18,6 +19,7 @@ import streamlit as st
 
 from google import genai
 from google.genai import types
+from google.genai.errors import ClientError, ServerError
 
 
 # =========================================================
@@ -219,6 +221,33 @@ TOOLS = [
 # Streamlit UI
 # =========================================================
 
+# =========================================================
+# Retry helper for transient Gemini server errors (503, 429)
+# =========================================================
+
+def send_message_with_retry(chat_session, user_input, max_attempts: int = 3):
+    """
+    Sends a message to the Gemini chat session, automatically retrying
+    on transient server errors (e.g. 503 UNAVAILABLE, 429 rate limit)
+    with a short backoff — instead of failing on the first hiccup.
+    """
+    last_error = None
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return chat_session.send_message(user_input)
+        except ServerError as error:
+            last_error = error
+            if attempt < max_attempts:
+                time.sleep(2 * attempt)
+                continue
+        except ClientError as error:
+            # Not worth retrying (bad request, invalid key, etc.)
+            raise error
+
+    raise last_error
+
+
 def main():
 
     # Cache the client itself across reruns — recreating it every rerun
@@ -297,11 +326,16 @@ def main():
         with st.chat_message("assistant"):
             with st.spinner("Thinking (and calling tools if needed)..."):
                 try:
-                    response = st.session_state.chat_session.send_message(
-                        user_input
+                    response = send_message_with_retry(
+                        st.session_state.chat_session, user_input
                     )
                     answer = response.text or (
                         "I couldn't generate a response. Please try again."
+                    )
+                except ServerError:
+                    answer = (
+                        "The AI model is experiencing high demand right now. "
+                        "Please wait a few seconds and try again."
                     )
                 except Exception as error:
                     answer = f"Error: {error}"
