@@ -221,7 +221,12 @@ TOOLS = [
 
 def main():
 
-    client = get_gemini_client()
+    # Cache the client itself across reruns — recreating it every rerun
+    # causes "client has been closed" errors on the second message.
+    if "gemini_client" not in st.session_state:
+        st.session_state.gemini_client = get_gemini_client()
+
+    client = st.session_state.gemini_client
 
     st.title("🤖 AI Agent — Tool Use")
 
