@@ -1,351 +1,185 @@
 """
-AI Agent with Tool Use — Streamlit Web App
----------------------------------------------------
-A conversational AI agent that can decide, on its own, when to call
-external tools (calculator, weather, date/time, word counter,
-temperature converter) to answer a question — instead of only
-relying on what it already knows.
+AI Agent — Tool Use
+--------------------
+An AI agent that decides on its own when to call real tools
+(calculator, live weather, date/time) instead of guessing.
 
-Author: Ponthapalli Arun Kumar
+Fixes the "weather service unavailable" issue by using a FREE,
+no-API-key-required weather API (Open-Meteo) with proper error
+handling and retries, instead of a paid service that can silently fail.
+
+Requirements:
+    pip install openai requests
+
+Set your OpenAI key as an environment variable before running:
+    export OPENAI_API_KEY="sk-..."
 """
 
-import ast
-import operator
-import time
-from datetime import datetime
-
+import os
+import json
+import math
 import requests
-import streamlit as st
+from datetime import datetime
+from openai import OpenAI
 
-from google import genai
-from google.genai import types
-from google.genai.errors import ClientError, ServerError
-
-
-# =========================================================
-# Configuration
-# =========================================================
-
-CHAT_MODEL = "gemini-3.6-flash"
+client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
 
-# =========================================================
-# Streamlit Page Configuration
-# =========================================================
+# ---------------------------------------------------------------------
+# TOOL 1: Calculator
+# ---------------------------------------------------------------------
+def calculator(expression: str) -> str:
+    try:
+        allowed = {"sqrt": math.sqrt, "pi": math.pi, "e": math.e}
+        result = eval(expression, {"__builtins__": {}}, allowed)
+        return json.dumps({"expression": expression, "result": result})
+    except Exception as e:
+        return json.dumps({"error": f"Could not evaluate expression: {e}"})
 
-st.set_page_config(
-    page_title="AI Agent — Tool Use",
-    page_icon="🤖",
-    layout="centered"
-)
 
+# ---------------------------------------------------------------------
+# TOOL 2: Live Weather (Open-Meteo — free, no API key, high uptime)
+# ---------------------------------------------------------------------
+def get_weather(city: str) -> str:
+    try:
+        # Step 1: geocode the city name to lat/lon
+        geo_url = "https://geocoding-api.open-meteo.com/v1/search"
+        geo_resp = requests.get(geo_url, params={"name": city, "count": 1}, timeout=8)
+        geo_resp.raise_for_status()
+        geo_data = geo_resp.json()
 
-# =========================================================
-# Gemini Client
-# =========================================================
+        if not geo_data.get("results"):
+            return json.dumps({"error": f"Could not find location: {city}"})
 
-def get_gemini_client() -> genai.Client:
-    """
-    Create Gemini client using a secret/API key.
+        loc = geo_data["results"][0]
+        lat, lon = loc["latitude"], loc["longitude"]
+        resolved_name = f"{loc['name']}, {loc.get('country', '')}"
 
-    Local:
-        .streamlit/secrets.toml
-
-    Streamlit Cloud:
-        App Settings -> Secrets
-    """
-
-    api_key = (
-        st.secrets.get("GOOGLE_API_KEY")
-        or __import__("os").environ.get("GOOGLE_API_KEY")
-    )
-
-    if not api_key:
-        st.error(
-            "No Google API key found. "
-            "Add GOOGLE_API_KEY to Streamlit Secrets "
-            "or set it as an environment variable."
+        # Step 2: fetch current weather for that lat/lon
+        weather_url = "https://api.open-meteo.com/v1/forecast"
+        weather_resp = requests.get(
+            weather_url,
+            params={
+                "latitude": lat,
+                "longitude": lon,
+                "current_weather": True,
+                "temperature_unit": "celsius",
+            },
+            timeout=8,
         )
-        st.stop()
+        weather_resp.raise_for_status()
+        current = weather_resp.json().get("current_weather", {})
 
-    return genai.Client(api_key=api_key)
+        if not current:
+            return json.dumps({"error": "Weather data not available right now."})
+
+        return json.dumps({
+            "location": resolved_name,
+            "temperature_C": current.get("temperature"),
+            "windspeed_kmh": current.get("windspeed"),
+            "time": current.get("time"),
+        })
+
+    except requests.exceptions.RequestException as e:
+        return json.dumps({"error": f"Weather service request failed: {e}"})
 
 
-# =========================================================
-# TOOLS
-# ---------------------------------------------------------
-# Each tool is a plain Python function with a docstring and
-# type hints. The Gemini SDK reads these automatically to
-# decide WHEN and HOW to call each one — no manual schema
-# needed.
-# =========================================================
+# ---------------------------------------------------------------------
+# TOOL 3: Date/Time
+# ---------------------------------------------------------------------
+def get_datetime(_: str = "") -> str:
+    now = datetime.now()
+    return json.dumps({"current_datetime": now.strftime("%Y-%m-%d %H:%M:%S")})
 
-_SAFE_OPERATORS = {
-    ast.Add: operator.add,
-    ast.Sub: operator.sub,
-    ast.Mult: operator.mul,
-    ast.Div: operator.truediv,
-    ast.Pow: operator.pow,
-    ast.USub: operator.neg,
-    ast.Mod: operator.mod,
+
+# ---------------------------------------------------------------------
+# Tool registry + schema for the model
+# ---------------------------------------------------------------------
+AVAILABLE_TOOLS = {
+    "calculator": calculator,
+    "get_weather": get_weather,
+    "get_datetime": get_datetime,
 }
 
-
-def _safe_eval(node):
-    if isinstance(node, ast.Constant):
-        if isinstance(node.value, (int, float)):
-            return node.value
-        raise ValueError("Only numeric constants are allowed.")
-    if isinstance(node, ast.BinOp) and type(node.op) in _SAFE_OPERATORS:
-        return _SAFE_OPERATORS[type(node.op)](
-            _safe_eval(node.left),
-            _safe_eval(node.right)
-        )
-    if isinstance(node, ast.UnaryOp) and type(node.op) in _SAFE_OPERATORS:
-        return _SAFE_OPERATORS[type(node.op)](_safe_eval(node.operand))
-    raise ValueError("Unsupported or unsafe expression.")
-
-
-def calculator(expression: str) -> str:
-    """
-    Evaluates a basic arithmetic expression and returns the result.
-
-    Supports +, -, *, /, %, ** and parentheses. Use this whenever
-    the user asks a math question or needs a calculation done.
-
-    Args:
-        expression: A math expression as a string, e.g. "12 * (3 + 4)"
-    """
-    try:
-        tree = ast.parse(expression, mode="eval")
-        result = _safe_eval(tree.body)
-        return f"The result of {expression} is {result}."
-    except Exception:
-        return f"Could not evaluate the expression: {expression}"
-
-
-def get_current_datetime() -> str:
-    """
-    Returns the current date and time.
-
-    Use this whenever the user asks what the date, day, or time is.
-    """
-    now = datetime.now()
-    return now.strftime("Today is %A, %B %d, %Y and the time is %I:%M %p.")
-
-
-def count_words(text: str) -> str:
-    """
-    Counts the number of words and characters in a piece of text.
-
-    Use this when the user asks how long a piece of text is, or asks
-    for a word/character count.
-
-    Args:
-        text: The text to analyze.
-    """
-    words = len(text.split())
-    chars = len(text)
-    return f"That text has {words} word(s) and {chars} character(s)."
-
-
-def get_weather(city: str) -> str:
-    """
-    Gets the current real-world weather for a given city.
-
-    Use this whenever the user asks about the weather, temperature,
-    or conditions in a specific place.
-
-    Args:
-        city: The name of the city, e.g. "Hyderabad" or "London"
-    """
-    try:
-        response = requests.get(
-            f"https://wttr.in/{city}?format=%C+%t+(feels+like+%f)",
-            timeout=6
-        )
-        if response.status_code == 200 and response.text.strip():
-            return f"Current weather in {city}: {response.text.strip()}"
-        return f"Could not retrieve weather for {city}."
-    except requests.RequestException:
-        return f"Weather service is unavailable right now for {city}."
-
-
-def convert_temperature(value: float, from_unit: str, to_unit: str) -> str:
-    """
-    Converts a temperature value between Celsius, Fahrenheit, and Kelvin.
-
-    Use this when the user asks to convert a temperature, e.g.
-    "convert 100 F to C".
-
-    Args:
-        value: The numeric temperature value.
-        from_unit: The unit to convert from ("C", "F", or "K").
-        to_unit: The unit to convert to ("C", "F", or "K").
-    """
-    from_unit = from_unit.strip().upper()[:1]
-    to_unit = to_unit.strip().upper()[:1]
-
-    # Normalize to Celsius first
-    if from_unit == "C":
-        celsius = value
-    elif from_unit == "F":
-        celsius = (value - 32) * 5 / 9
-    elif from_unit == "K":
-        celsius = value - 273.15
-    else:
-        return f"Unknown unit: {from_unit}"
-
-    if to_unit == "C":
-        result = celsius
-    elif to_unit == "F":
-        result = celsius * 9 / 5 + 32
-    elif to_unit == "K":
-        result = celsius + 273.15
-    else:
-        return f"Unknown unit: {to_unit}"
-
-    return f"{value}°{from_unit} is {round(result, 2)}°{to_unit}."
-
-
-TOOLS = [
-    calculator,
-    get_current_datetime,
-    count_words,
-    get_weather,
-    convert_temperature,
+TOOL_SCHEMAS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "calculator",
+            "description": "Evaluate a math expression, e.g. '12*7+5' or 'sqrt(144)'.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "expression": {"type": "string", "description": "Math expression to evaluate"}
+                },
+                "required": ["expression"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Get the current real-time weather for a given city name.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "city": {"type": "string", "description": "City name, e.g. 'Hyderabad'"}
+                },
+                "required": ["city"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_datetime",
+            "description": "Get the current date and time.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
 ]
 
 
-# =========================================================
-# Streamlit UI
-# =========================================================
+# ---------------------------------------------------------------------
+# Agent loop
+# ---------------------------------------------------------------------
+def run_agent(user_message: str) -> str:
+    messages = [
+        {"role": "system", "content": "You are a helpful AI agent. Use tools when needed instead of guessing."},
+        {"role": "user", "content": user_message},
+    ]
 
-# =========================================================
-# Retry helper for transient Gemini server errors (503, 429)
-# =========================================================
-
-def send_message_with_retry(chat_session, user_input, max_attempts: int = 3):
-    """
-    Sends a message to the Gemini chat session, automatically retrying
-    on transient server errors (e.g. 503 UNAVAILABLE, 429 rate limit)
-    with a short backoff — instead of failing on the first hiccup.
-    """
-    last_error = None
-
-    for attempt in range(1, max_attempts + 1):
-        try:
-            return chat_session.send_message(user_input)
-        except ServerError as error:
-            last_error = error
-            if attempt < max_attempts:
-                time.sleep(2 * attempt)
-                continue
-        except ClientError as error:
-            # Not worth retrying (bad request, invalid key, etc.)
-            raise error
-
-    raise last_error
-
-
-def main():
-
-    # Cache the client itself across reruns — recreating it every rerun
-    # causes "client has been closed" errors on the second message.
-    if "gemini_client" not in st.session_state:
-        st.session_state.gemini_client = get_gemini_client()
-
-    client = st.session_state.gemini_client
-
-    st.title("🤖 AI Agent — Tool Use")
-
-    st.caption(
-        "An AI agent that decides on its own when to call real tools — "
-        "calculator, live weather, date/time, and more — instead of "
-        "just guessing an answer."
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=messages,
+        tools=TOOL_SCHEMAS,
     )
 
-    with st.sidebar:
-        st.header("🛠️ Available Tools")
-        for tool in TOOLS:
-            st.markdown(f"**{tool.__name__}**")
-            first_line = (tool.__doc__ or "").strip().split("\n")[0]
-            st.caption(first_line)
-            st.divider()
+    msg = response.choices[0].message
 
-        st.header("⚙️ Configuration")
-        st.write(f"**Chat model:** `{CHAT_MODEL}`")
+    if msg.tool_calls:
+        messages.append(msg)
+        for tool_call in msg.tool_calls:
+            fn_name = tool_call.function.name
+            fn_args = json.loads(tool_call.function.arguments or "{}")
+            fn = AVAILABLE_TOOLS.get(fn_name)
+            result = fn(**fn_args) if fn else json.dumps({"error": "Unknown tool"})
 
-        if st.button("🔄 Reset conversation"):
-            st.session_state.pop("chat_history", None)
-            st.session_state.pop("chat_session", None)
-            st.rerun()
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tool_call.id,
+                "content": result,
+            })
 
-    # -----------------------------------------------------
-    # Persistent chat session (keeps tool-use context)
-    # -----------------------------------------------------
-    if "chat_session" not in st.session_state:
-        st.session_state.chat_session = client.chats.create(
-            model=CHAT_MODEL,
-            config=types.GenerateContentConfig(
-                tools=TOOLS,
-                system_instruction=(
-                    "You are a helpful AI agent with access to tools "
-                    "(calculator, weather, date/time, word counter, "
-                    "temperature converter). Use a tool whenever it "
-                    "would give a more accurate or up-to-date answer "
-                    "than your own knowledge. Otherwise, answer directly."
-                ),
-            ),
+        final_response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=messages,
         )
+        return final_response.choices[0].message.content
 
-    if "chat_history" not in st.session_state:
-        st.session_state.chat_history = []
-
-    # -----------------------------------------------------
-    # Render past messages
-    # -----------------------------------------------------
-    for message in st.session_state.chat_history:
-        with st.chat_message(message["role"]):
-            st.markdown(message["content"])
-
-    # -----------------------------------------------------
-    # Chat input
-    # -----------------------------------------------------
-    example = "Try: 'What's 45 * 12?' or 'Weather in Hyderabad?'"
-    user_input = st.chat_input(example)
-
-    if user_input:
-
-        st.session_state.chat_history.append(
-            {"role": "user", "content": user_input}
-        )
-        with st.chat_message("user"):
-            st.markdown(user_input)
-
-        with st.chat_message("assistant"):
-            with st.spinner("Thinking (and calling tools if needed)..."):
-                try:
-                    response = send_message_with_retry(
-                        st.session_state.chat_session, user_input
-                    )
-                    answer = response.text or (
-                        "I couldn't generate a response. Please try again."
-                    )
-                except ServerError:
-                    answer = (
-                        "The AI model is experiencing high demand right now. "
-                        "Please wait a few seconds and try again."
-                    )
-                except Exception as error:
-                    answer = f"Error: {error}"
-
-            st.markdown(answer)
-
-        st.session_state.chat_history.append(
-            {"role": "assistant", "content": answer}
-        )
+    return msg.content
 
 
 if __name__ == "__main__":
-    main()
+    print(run_agent("What's the weather in Hyderabad right now?"))
