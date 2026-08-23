@@ -1,185 +1,102 @@
-"""
-AI Agent — Tool Use
---------------------
-An AI agent that decides on its own when to call real tools
-(calculator, live weather, date/time) instead of guessing.
-
-Fixes the "weather service unavailable" issue by using a FREE,
-no-API-key-required weather API (Open-Meteo) with proper error
-handling and retries, instead of a paid service that can silently fail.
-
-Requirements:
-    pip install openai requests
-
-Set your OpenAI key as an environment variable before running:
-    export OPENAI_API_KEY="sk-..."
-"""
-
-import os
 import json
-import math
-import requests
-from datetime import datetime
+import streamlit as st
 from openai import OpenAI
 
-client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+# --- Page setup ---
+st.set_page_config(page_title="AI Agent Tool Use", page_icon="🤖")
+st.title("🤖 AI Agent with Tool Use")
 
+# --- API key from Streamlit secrets (never hardcode it in code) ---
+if "OPENAI_API_KEY" not in st.secrets:
+    st.error(
+        "Missing OPENAI_API_KEY. Go to Manage app -> Settings -> Secrets "
+        "and add: OPENAI_API_KEY = \"sk-...\""
+    )
+    st.stop()
 
-# ---------------------------------------------------------------------
-# TOOL 1: Calculator
-# ---------------------------------------------------------------------
-def calculator(expression: str) -> str:
-    try:
-        allowed = {"sqrt": math.sqrt, "pi": math.pi, "e": math.e}
-        result = eval(expression, {"__builtins__": {}}, allowed)
-        return json.dumps({"expression": expression, "result": result})
-    except Exception as e:
-        return json.dumps({"error": f"Could not evaluate expression: {e}"})
+client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
 
-
-# ---------------------------------------------------------------------
-# TOOL 2: Live Weather (Open-Meteo — free, no API key, high uptime)
-# ---------------------------------------------------------------------
+# --- Example tool the model can call ---
 def get_weather(city: str) -> str:
-    try:
-        # Step 1: geocode the city name to lat/lon
-        geo_url = "https://geocoding-api.open-meteo.com/v1/search"
-        geo_resp = requests.get(geo_url, params={"name": city, "count": 1}, timeout=8)
-        geo_resp.raise_for_status()
-        geo_data = geo_resp.json()
+    # Replace this with a real weather API call if needed
+    return f"The weather in {city} is sunny and 25°C."
 
-        if not geo_data.get("results"):
-            return json.dumps({"error": f"Could not find location: {city}"})
-
-        loc = geo_data["results"][0]
-        lat, lon = loc["latitude"], loc["longitude"]
-        resolved_name = f"{loc['name']}, {loc.get('country', '')}"
-
-        # Step 2: fetch current weather for that lat/lon
-        weather_url = "https://api.open-meteo.com/v1/forecast"
-        weather_resp = requests.get(
-            weather_url,
-            params={
-                "latitude": lat,
-                "longitude": lon,
-                "current_weather": True,
-                "temperature_unit": "celsius",
-            },
-            timeout=8,
-        )
-        weather_resp.raise_for_status()
-        current = weather_resp.json().get("current_weather", {})
-
-        if not current:
-            return json.dumps({"error": "Weather data not available right now."})
-
-        return json.dumps({
-            "location": resolved_name,
-            "temperature_C": current.get("temperature"),
-            "windspeed_kmh": current.get("windspeed"),
-            "time": current.get("time"),
-        })
-
-    except requests.exceptions.RequestException as e:
-        return json.dumps({"error": f"Weather service request failed: {e}"})
-
-
-# ---------------------------------------------------------------------
-# TOOL 3: Date/Time
-# ---------------------------------------------------------------------
-def get_datetime(_: str = "") -> str:
-    now = datetime.now()
-    return json.dumps({"current_datetime": now.strftime("%Y-%m-%d %H:%M:%S")})
-
-
-# ---------------------------------------------------------------------
-# Tool registry + schema for the model
-# ---------------------------------------------------------------------
-AVAILABLE_TOOLS = {
-    "calculator": calculator,
-    "get_weather": get_weather,
-    "get_datetime": get_datetime,
-}
-
-TOOL_SCHEMAS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "calculator",
-            "description": "Evaluate a math expression, e.g. '12*7+5' or 'sqrt(144)'.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "expression": {"type": "string", "description": "Math expression to evaluate"}
-                },
-                "required": ["expression"],
-            },
-        },
-    },
+tools = [
     {
         "type": "function",
         "function": {
             "name": "get_weather",
-            "description": "Get the current real-time weather for a given city name.",
+            "description": "Get the current weather for a given city",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "city": {"type": "string", "description": "City name, e.g. 'Hyderabad'"}
+                    "city": {"type": "string", "description": "City name"}
                 },
                 "required": ["city"],
             },
         },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_datetime",
-            "description": "Get the current date and time.",
-            "parameters": {"type": "object", "properties": {}},
-        },
-    },
+    }
 ]
 
+available_functions = {"get_weather": get_weather}
 
-# ---------------------------------------------------------------------
-# Agent loop
-# ---------------------------------------------------------------------
-def run_agent(user_message: str) -> str:
-    messages = [
-        {"role": "system", "content": "You are a helpful AI agent. Use tools when needed instead of guessing."},
-        {"role": "user", "content": user_message},
-    ]
+# --- Chat history state ---
+if "messages" not in st.session_state:
+    st.session_state.messages = []
 
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=messages,
-        tools=TOOL_SCHEMAS,
-    )
+# Render past messages
+for msg in st.session_state.messages:
+    if msg["role"] in ("user", "assistant") and msg.get("content"):
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
 
-    msg = response.choices[0].message
+# --- Chat input ---
+user_input = st.chat_input("Ask me something...")
 
-    if msg.tool_calls:
-        messages.append(msg)
-        for tool_call in msg.tool_calls:
-            fn_name = tool_call.function.name
-            fn_args = json.loads(tool_call.function.arguments or "{}")
-            fn = AVAILABLE_TOOLS.get(fn_name)
-            result = fn(**fn_args) if fn else json.dumps({"error": "Unknown tool"})
+if user_input:
+    st.session_state.messages.append({"role": "user", "content": user_input})
+    with st.chat_message("user"):
+        st.markdown(user_input)
 
-            messages.append({
-                "role": "tool",
-                "tool_call_id": tool_call.id,
-                "content": result,
-            })
+    with st.chat_message("assistant"):
+        with st.spinner("Thinking..."):
+            try:
+                response = client.chat.completions.create(
+                    model="gpt-4o-mini",
+                    messages=st.session_state.messages,
+                    tools=tools,
+                )
+                msg = response.choices[0].message
 
-        final_response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=messages,
-        )
-        return final_response.choices[0].message.content
+                # If the model wants to call a tool
+                if msg.tool_calls:
+                    st.session_state.messages.append(msg.model_dump())
 
-    return msg.content
+                    for tool_call in msg.tool_calls:
+                        func_name = tool_call.function.name
+                        func_args = json.loads(tool_call.function.arguments)
+                        result = available_functions[func_name](**func_args)
 
+                        st.session_state.messages.append({
+                            "role": "tool",
+                            "tool_call_id": tool_call.id,
+                            "content": result,
+                        })
 
-if __name__ == "__main__":
-    print(run_agent("What's the weather in Hyderabad right now?"))
+                    # Get the final natural-language response after tool execution
+                    follow_up = client.chat.completions.create(
+                        model="gpt-4o-mini",
+                        messages=st.session_state.messages,
+                    )
+                    final_reply = follow_up.choices[0].message.content
+                    st.markdown(final_reply)
+                    st.session_state.messages.append(
+                        {"role": "assistant", "content": final_reply}
+                    )
+                else:
+                    st.markdown(msg.content)
+                    st.session_state.messages.append(
+                        {"role": "assistant", "content": msg.content}
+                    )
+            except Exception as e:
+                st.error(f"Error calling OpenAI API: {e}")
