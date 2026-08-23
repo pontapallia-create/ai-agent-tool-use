@@ -16,7 +16,7 @@ if "GEMINI_API_KEY" not in st.secrets:
     st.stop()
 
 client = genai.Client(api_key=st.secrets["GEMINI_API_KEY"])
-MODEL_NAME = "gemini-2.0-flash"
+MODEL_NAME = "gemini-3.6-flash"
 
 # --- Example tool the model can call ---
 def get_weather(city: str) -> str:
